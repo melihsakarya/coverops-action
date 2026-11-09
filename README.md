@@ -178,3 +178,10 @@ ran the changed code, with how many tests went through each.
 
 Inputs reach the scripts as environment variables, never as script text, so a
 branch name or an input value cannot run as a command.
+
+## License
+
+This action (`action.yml` and this README) is licensed under the
+[Apache License 2.0](LICENSE). The CoverOps CLI it installs and the CoverOps
+service are covered by their own terms. "CoverOps" is a trademark; the license
+does not grant use of it (Apache-2.0, section 6).
