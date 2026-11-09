@@ -1,0 +1,162 @@
+name: CoverOps Test Selection
+description: Test selection, the quarantine-aware verdict and the changed-code gate from CoverOps, in one step.
+author: CoverOps
+branding:
+  icon: check-circle
+  color: green
+
+inputs:
+  endpoint:
+    description: Your CoverOps address, e.g. https://coverops.example.com (the CLI is installed from it).
+    required: true
+  token:
+    description: An agent token (Agents page). Pass it from a secret.
+    required: true
+  command:
+    description: "select (which tests the change cannot reach), verdict (fail only on non-quarantined failures) or gate (changed-code coverage)."
+    required: false
+    default: select
+  base:
+    description: The ref the change is measured from. Defaults to the pull request's base branch, else the default branch.
+    required: false
+    default: ""
+  ignore:
+    description: "select: comma-separated globs of changed paths that cannot affect a test, e.g. web/**,deploy/**"
+    required: false
+    default: ""
+  observe:
+    description: "select: record what would be skipped and skip nothing (skip stays empty, mode is observe). Once the run's results arrive, the dashboard's Test selection page shows what skipping would have missed and saved. Run this for a while before acting on skip."
+    required: false
+    default: "false"
+  time:
+    description: "select: a time budget, e.g. 15m. The lowest-risk impacted tests that do not fit are skipped too; never a test without a footprint, never the floor that still reaches every changed line."
+    required: false
+    default: ""
+  target:
+    description: "select: a budget as a share of the safe selection's own test time, e.g. 60%."
+    required: false
+    default: ""
+  junit:
+    description: "verdict: JUnit XML reports — a file, a directory or a glob."
+    required: false
+    default: ""
+  comment:
+    description: "gate: also write the verdict, the untested changed lines and why any test failed as one pull request comment (needs pull-requests: write)."
+    required: false
+    default: "false"
+  args:
+    description: Any further flags for the command, e.g. --min-changed 80 for gate.
+    required: false
+    default: ""
+
+outputs:
+  skip:
+    description: "select: the tests that may be skipped, one suite::name per line. Empty means run everything."
+    value: ${{ steps.run.outputs.skip }}
+  mode:
+    description: "select: subset, all when the whole suite must run, or observe (recorded only; run everything)."
+    value: ${{ steps.run.outputs.mode }}
+
+runs:
+  using: composite
+  steps:
+    # Inputs reach the scripts as environment variables, never pasted into
+    # the script text, so a value cannot become a command.
+    - name: Fetch the base branch
+      shell: bash
+      env:
+        COVEROPS_BASE_INPUT: ${{ inputs.base }}
+        PR_BASE: ${{ github.base_ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+        branch="${PR_BASE:-$DEFAULT_BRANCH}"
+        base="${COVEROPS_BASE_INPUT:-origin/$branch}"
+        echo "COVERAGEOPS_BASE=$base" >> "$GITHUB_ENV"
+        # rev-list needs the base and enough history to meet it.
+        if [ -n "$branch" ]; then
+          git fetch --no-tags --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" --depth=500 || true
+        fi
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --no-tags --quiet --deepen=500 || true
+        fi
+
+    - name: Install the CoverOps CLI
+      shell: bash
+      env:
+        COVERAGEOPS_ENDPOINT: ${{ inputs.endpoint }}
+      run: |
+        set -euo pipefail
+        npm install --global --silent "${COVERAGEOPS_ENDPOINT%/}/v1/agents/artifact/cli"
+        command -v coverageops >/dev/null
+
+    - id: run
+      name: coverageops ${{ inputs.command }}
+      shell: bash
+      env:
+        COVERAGEOPS_ENDPOINT: ${{ inputs.endpoint }}
+        COVERAGEOPS_TOKEN: ${{ inputs.token }}
+        COVEROPS_COMMAND: ${{ inputs.command }}
+        COVEROPS_IGNORE: ${{ inputs.ignore }}
+        COVEROPS_JUNIT: ${{ inputs.junit }}
+        COVEROPS_ARGS: ${{ inputs.args }}
+        COVEROPS_COMMENT: ${{ inputs.comment }}
+        COVEROPS_OBSERVE: ${{ inputs.observe }}
+        COVERAGEOPS_SELECT_TIME: ${{ inputs.time }}
+        COVERAGEOPS_SELECT_TARGET: ${{ inputs.target }}
+        # The workflow's own token: commit status and the pull request comment.
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -uo pipefail
+        # ${a[@]+"${a[@]}"}: an empty array under set -u, on every bash (macOS ships 3.2).
+        extra=()
+        [ -n "$COVEROPS_ARGS" ] && read -r -a extra <<< "$COVEROPS_ARGS"
+        case "$COVEROPS_COMMAND" in
+          select)
+            ignore=()
+            [ -n "$COVEROPS_IGNORE" ] && ignore=(--ignore "$COVEROPS_IGNORE")
+            observe=()
+            [ "$COVEROPS_OBSERVE" = "true" ] && observe=(--observe)
+            answer=$(coverageops select --base "$COVERAGEOPS_BASE" --format json ${ignore[@]+"${ignore[@]}"} ${observe[@]+"${observe[@]}"} ${extra[@]+"${extra[@]}"}) || exit $?
+            mode=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(0,"utf8")).mode)' <<< "$answer")
+            # Observation acts on nothing: an empty skip list, whatever the answer.
+            [ "$COVEROPS_OBSERVE" = "true" ] && mode=observe
+            echo "mode=$mode" >> "$GITHUB_OUTPUT"
+            {
+              echo "skip<<COVEROPS_EOF"
+              [ "$mode" = "subset" ] && node -e 'for (const t of JSON.parse(require("fs").readFileSync(0,"utf8")).skip) console.log(t.selector)' <<< "$answer"
+              echo "COVEROPS_EOF"
+            } >> "$GITHUB_OUTPUT"
+            node -e '
+              const r = JSON.parse(require("fs").readFileSync(0, "utf8"));
+              const observe = process.env.COVEROPS_OBSERVE === "true";
+              const lines = r.mode === "all"
+                ? ["**CoverOps:** " + (observe ? "would run" : "run") + " every test — " + (r.full_run?.detail ?? "the change could not be read in full")]
+                : ["**CoverOps:** " + r.run.length + " tests to run, " + r.skip.length + " may be skipped (" + r.changed_files + " changed files)"];
+              const base = r.baseline;
+              if (base && base.base_sha) lines.push("Measured against `" + base.ref + "` @ `" + base.base_sha.slice(0, 7) + "` (merge base): " + base.commits_asked + " commits.");
+              if (r.candidates && r.candidates.unmatched) lines.push("⚠️ " + r.candidates.unmatched + " of " + r.candidates.sent + " candidates are unknown to CoverOps and always run.");
+              const b = r.budget;
+              if (b && b.limit_ms !== null) {
+                const min = (ms) => (ms < 60000 ? Math.round(ms / 1000) + " s" : Math.round(ms / 60000) + " min");
+                lines.push(b.applied
+                  ? "Budget " + min(b.limit_ms) + ": runs " + min(b.used_ms) + " of the " + min(b.safe_ms) + " the safe selection needs; " + b.deferred + " impacted tests deferred, every changed line still reached." + (b.exceeded ? " " + b.note + "." : "")
+                  : "Budget " + min(b.limit_ms) + " not applied: " + b.note + ".");
+              }
+              if (observe) lines.push("Observation only: every test runs, and the answer is measured against this run on the Test selection page.");
+              require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+            ' <<< "$answer"
+            ;;
+          verdict)
+            coverageops verdict --junit "${COVEROPS_JUNIT:?verdict needs the junit input}" ${extra[@]+"${extra[@]}"}
+            ;;
+          gate)
+            comment=()
+            [ "$COVEROPS_COMMENT" = "true" ] && comment=(--comment)
+            coverageops gate --base "$COVERAGEOPS_BASE" ${comment[@]+"${comment[@]}"} ${extra[@]+"${extra[@]}"}
+            ;;
+          *)
+            echo "Unknown command: $COVEROPS_COMMAND (select, verdict or gate)" >&2
+            exit 2
+            ;;
+        esac
